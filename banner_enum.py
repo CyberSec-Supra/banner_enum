@@ -11,145 +11,213 @@ import concurrent.futures
 import json
 import xml.etree.ElementTree as ET
 import os
+import importlib.util
+import sys
+
+USE_WEASYPRINT = False
+USE_XHTML2PDF = False
 
 try:
     from weasyprint import HTML
     USE_WEASYPRINT = True
 except ImportError:
-    USE_WEASYPRINT = False
-    try:
-        from xhtml2pdf import pisa
-        USE_XHTML2PDF = True
-    except ImportError:
-        USE_XHTML2PDF = False
+    pass
+
+try:
+    from xhtml2pdf import pisa
+    USE_XHTML2PDF = True
+except ImportError:
+    pass
+
+def pipx_module_exists(module_name):
+    home = os.path.expanduser("~")
+    pipx_base = os.path.join(home, ".local", "pipx", "venvs", module_name, "lib")
+    for root, dirs, files in os.walk(pipx_base):
+        if "site-packages" in root:
+            sys.path.insert(0, root)
+            try:
+                importlib.import_module(module_name)
+                return root
+            except ImportError:
+                continue
+    return None
+
+if not USE_WEASYPRINT:
+    path = pipx_module_exists("weasyprint")
+    if path:
+        try:
+            from weasyprint import HTML
+            USE_WEASYPRINT = True
+        except ImportError:
+            pass
+
+if not USE_XHTML2PDF:
+    path = pipx_module_exists("xhtml2pdf")
+    if path:
+        try:
+            from xhtml2pdf import pisa
+            USE_XHTML2PDF = True
+        except ImportError:
+            pass
 
 NVD_API_BASE = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+CPE_API_BASE = "https://services.nvd.nist.gov/rest/json/cpes/2.0"
 
-# Placeholder: read_targets and scan_target must be defined
+SERVICE_PATTERNS = {
+    "ssh": [r"SSH-\d\.\d"],
+    "ftp": [r"FTP", r"220 .*ftp", r"FileZilla"],
+    "http": [r"HTTP/1\.[01]", r"Server:.*"],
+    "telnet": [r"^\xFF\xFB", r"telnet"],
+    "smb": [r"SMB", r"NT_STATUS"],
+    "smtp": [r"SMTP"],
+    "rdp": [r"RDP"],
+    "mysql": [r"mysql"]
+}
 
-def render_html(results, output_file):
-    html = [
-        "<html><head><title>Vulnerability Report</title><style>",
-        "body { font-family: Arial; }",
-        "table { border-collapse: collapse; width: 100%; }",
-        "th, td { border: 1px solid #ddd; padding: 8px; }",
-        "th { background-color: #f2f2f2; }",
-        ".high { background-color: #f8d7da; }",
-        ".medium { background-color: #fff3cd; }",
-        ".low { background-color: #d4edda; }",
-        "</style></head><body>",
-        "<h1>Service Vulnerability Report</h1>",
-        "<h2>Severity Legend:</h2>",
-        "<ul>",
-        "<li><span style='background-color:#f8d7da;'>High (CVSS ≥ 7)</span></li>",
-        "<li><span style='background-color:#fff3cd;'>Medium (CVSS 4–6.9)</span></li>",
-        "<li><span style='background-color:#d4edda;'>Low (CVSS < 4)</span></li>",
-        "</ul>",
-        "<table><tr><th>IP</th><th>Port</th><th>Service</th><th>Product</th><th>Version</th><th>Banner</th><th>NVD CVEs</th></tr>"
-    ]
+def read_targets(input_file):
+    targets = []
+    with open(input_file, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            matches = re.findall(r"(\d+\.\d+\.\d+\.\d+):(\d+)", line)
+            for match in matches:
+                ip, port = match
+                try:
+                    targets.append((ip.strip(), int(port.strip())))
+                except ValueError:
+                    print(f"[!] Skipping malformed entry: {line}")
+    return targets
 
-    for entry in results:
-        max_score = 0
-        for cve in entry.get("nvd_cves", []):
-            match = re.search(r"CVSS ([0-9.]+)", cve)
-            if match:
-                score = float(match.group(1))
-                if score > max_score:
-                    max_score = score
+def detect_service(banner):
+    for service, patterns in SERVICE_PATTERNS.items():
+        for pattern in patterns:
+            if re.search(pattern, banner, re.IGNORECASE):
+                return service
+    return "unknown"
 
-        if max_score >= 7:
-            row_class = "high"
-        elif 4 <= max_score < 7:
-            row_class = "medium"
-        elif 0 < max_score < 4:
-            row_class = "low"
-        else:
-            row_class = ""
+def get_cpe_candidates(banner):
+    try:
+        resp = requests.get(CPE_API_BASE, params={"keyword": banner, "resultsPerPage": 1}, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if "products" in data:
+                for product in data["products"]:
+                    cpe = product.get("cpe", {}).get("cpeName")
+                    if cpe:
+                        return cpe
+    except Exception:
+        pass
+    return ""
 
-        html.append(f"<tr class='{row_class}'><td>{entry['ip']}</td><td>{entry['port']}</td><td>{entry['service']}</td><td>{entry.get('product','')}</td><td>{entry.get('version','')}</td><td>{entry['banner']}</td><td><ul>")
-        for cve in entry.get("nvd_cves", []):
-            html.append(f"<li>{cve}</li>")
-        html.append("</ul></td></tr>")
+def scan_target(target, apikey):
+    ip, port = target
+    try:
+        with socket.create_connection((ip, port), timeout=3) as sock:
+            sock.sendall(b'\r\n')
+            banner = sock.recv(1024).decode(errors='ignore').strip()
+    except Exception:
+        banner = ''
 
-    html.append("</table></body></html>")
-    with open(output_file, "w") as f:
-        f.write("\n".join(html))
+    service = detect_service(banner) if banner else ("ssh" if port == 22 else "http" if port in [80, 8080] else "unknown")
+    cpe = get_cpe_candidates(banner) if banner else ""
 
-def export_json(results, json_file):
-    with open(json_file, "w") as f:
-        json.dump(results, f, indent=2)
+    result = {
+        "ip": ip,
+        "port": port,
+        "service": service,
+        "product": "",
+        "version": "",
+        "banner": banner,
+        "cpe": cpe,
+        "nvd_cves": []
+    }
 
-def export_xml(results, xml_file):
-    root = ET.Element("results")
-    for entry in results:
-        item = ET.SubElement(root, "host")
-        for key, val in entry.items():
-            if isinstance(val, list):
-                child = ET.SubElement(item, key)
-                for subval in val:
-                    ET.SubElement(child, "entry").text = str(subval)
-            else:
-                ET.SubElement(item, key).text = str(val)
-    tree = ET.ElementTree(root)
-    tree.write(xml_file)
+    if banner:
+        q = cpe if cpe else f"{service} {banner}".strip()
+        try:
+            resp = requests.get(NVD_API_BASE, params={"keywordSearch": q, "resultsPerPage": 5}, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                for item in data.get("vulnerabilities", []):
+                    cve = item.get("cve")
+                    if cve:
+                        score = cve.get("metrics", {}).get("cvssMetricV31", [{}])[0].get("cvssData", {}).get("baseScore", "")
+                        result["nvd_cves"].append(f"{cve['id']} (CVSS {score})")
+        except Exception:
+            pass
 
-def export_nuclei(results, nuclei_file):
-    with open(nuclei_file, "w") as f:
-        for entry in results:
-            if entry.get("service"):
-                f.write(f"{entry['ip']}:{entry['port']} [{entry['service']}]")
-                f.write("\n")
+    return result
 
-def export_pdf(html_path, pdf_path):
-    with open(html_path, "r") as f:
-        html_content = f.read()
-
-    if USE_WEASYPRINT:
-        HTML(string=html_content).write_pdf(pdf_path)
-    elif USE_XHTML2PDF:
-        with open(pdf_path, "wb") as f_out:
-            pisa.CreatePDF(html_content, dest=f_out)
-    else:
-        print("[!] PDF export failed: No PDF engine (weasyprint or xhtml2pdf) is available.")
-
-def main():
-    parser = argparse.ArgumentParser(description="Threaded Service and Vulnerability Enumeration")
-    parser.add_argument("-i", "--input", help="Input file with IP:PORT lines", required=True)
-    parser.add_argument("-k", "--apikey", help="Vulners API key", required=False)
-    parser.add_argument("-o", "--output", help="Output HTML report filename", default="report.html")
-    parser.add_argument("--json", help="Optional JSON export file")
-    parser.add_argument("--xml", help="Optional XML export file")
-    parser.add_argument("--nuclei", help="Optional Nuclei-compatible export file")
-    parser.add_argument("--pdf", help="Optional PDF output file")
-    args = parser.parse_args()
-
-    targets = read_targets(args.input)
-    results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
-        futures = {executor.submit(scan_target, target, args.apikey): target for target in targets}
-        for future in concurrent.futures.as_completed(futures):
-            result = future.result()
-            results.append(result)
-
-    render_html(results, args.output)
-    print(f"[*] HTML report written to {args.output}")
-
+def export_results(results, args):
     if args.json:
-        export_json(results, args.json)
+        with open(args.json, 'w') as f:
+            json.dump(results, f, indent=2)
         print(f"[*] JSON exported to {args.json}")
 
     if args.xml:
-        export_xml(results, args.xml)
+        root = ET.Element("results")
+        for r in results:
+            host = ET.SubElement(root, "host")
+            for key, value in r.items():
+                child = ET.SubElement(host, key)
+                if isinstance(value, list):
+                    child.text = ", ".join(value)
+                else:
+                    child.text = str(value)
+        tree = ET.ElementTree(root)
+        tree.write(args.xml)
         print(f"[*] XML exported to {args.xml}")
 
-    if args.nuclei:
-        export_nuclei(results, args.nuclei)
-        print(f"[*] Nuclei template exported to {args.nuclei}")
+    if args.output:
+        with open(args.output, 'w') as f:
+            f.write("<html><head><title>Scan Report</title></head><body>")
+            f.write("<h1>Service Enumeration Report</h1>")
+            for r in results:
+                f.write("<div style='margin-bottom:15px;'><b>{ip}:{port}</b><br>Service: {service}<br>Banner: {banner}<br>CVEs: {cves}</div>".format(
+                    ip=r["ip"], port=r["port"], service=r["service"], banner=r["banner"], cves="<br>".join(r["nvd_cves"])))
+            f.write("<hr><p><b>Severity Legend:</b> CVSS 0.0–3.9 = Low, 4.0–6.9 = Medium, 7.0–8.9 = High, 9.0–10 = Critical</p>")
+            f.write("</body></html>")
+        print(f"[*] HTML report written to {args.output}")
 
     if args.pdf:
-        export_pdf(args.output, args.pdf)
-        if os.path.exists(args.pdf):
-            print(f"[*] PDF exported to {args.pdf}")
+        if USE_WEASYPRINT:
+            try:
+                HTML(args.output).write_pdf(args.pdf)
+                print(f"[*] PDF exported to {args.pdf} using WeasyPrint")
+            except Exception as e:
+                print(f"[!] PDF export failed (WeasyPrint): {e}")
+        elif USE_XHTML2PDF:
+            try:
+                with open(args.output, 'r') as f:
+                    html = f.read()
+                with open(args.pdf, 'wb') as out:
+                    pisa.CreatePDF(html, dest=out)
+                print(f"[*] PDF exported to {args.pdf} using XHTML2PDF")
+            except Exception as e:
+                print(f"[!] PDF export failed (XHTML2PDF): {e}")
+        else:
+            print("[!] PDF export failed: No PDF engine (weasyprint or xhtml2pdf) is available.")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-i", "--input", required=True, help="Input file with IP:port list")
+    parser.add_argument("-k", "--key", required=False, help="Vulners or API key (optional)")
+    parser.add_argument("-o", "--output", help="HTML output filename")
+    parser.add_argument("--json", help="Export results to JSON file")
+    parser.add_argument("--xml", help="Export results to XML file")
+    parser.add_argument("--pdf", help="Export results to PDF file")
+    args = parser.parse_args()
+
+    targets = read_targets(args.input)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(scan_target, t, args.key) for t in targets]
+        results = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+    export_results(results, args)
+
+print(f"[DEBUG] WeasyPrint available: {USE_WEASYPRINT}, XHTML2PDF available: {USE_XHTML2PDF}")
 
 if __name__ == "__main__":
     main()
