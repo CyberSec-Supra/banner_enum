@@ -10,3 +10,8 @@ Local copy of searchsploit required to search local.
 usage: banner_enum.py [-h] -i INPUT [-b BANNERS] [-o OUTPUT] [-k VULNERS_KEY] [-d DELAY] [--html-out reportname.html]
 
 A nuclei template are generated on completion and a html export report. 
+
+
+SYSTEM REQUIREMENT:
+
+sudo apt install libpango-1.0-0 libgdk-pixbuf-2.0-0 libffi-dev libcairo2
