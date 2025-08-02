@@ -18,3 +18,6 @@ A nuclei template are generated on completion and a html export report.
 SYSTEM REQUIREMENT:
 
 sudo apt install python3-cffi libpango-1.0-0 libcairo2 libgdk-pixbuf-2.0-0 libffi-dev libxml2 libxslt1.1 libjpeg-dev zlib1g-dev libpng-dev libpango1.0-dev
+The script assumes that pipx was used to install the requirements for the PDF export.
+If not, the pdf export will be skipped with all the other formats still available.
+
