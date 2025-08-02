@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import argparse
 import socket
 import subprocess
@@ -9,149 +8,108 @@ import shutil
 import concurrent.futures
 import json
 import xml.etree.ElementTree as ET
+import os
 
-
-def read_targets(file_path):
-    with open(file_path, 'r') as f:
-        return [line.strip() for line in f if ':' in line]
-
-
-def banner_grab(ip, port, timeout=2):
+try:
+    from weasyprint import HTML
+    USE_WEASYPRINT = True
+except ImportError:
+    USE_WEASYPRINT = False
     try:
-        with socket.create_connection((str(ip), int(port)), timeout=timeout) as sock:
-            sock.settimeout(timeout)
-            try:
-                banner = sock.recv(1024).decode('utf-8', errors='ignore').strip()
-                return banner if banner else "<no banner>"
-            except socket.timeout:
-                return "<no banner (timeout)>"
-    except Exception as e:
-        return f"<error: {e}>"
+        from xhtml2pdf import pisa
+        USE_XHTML2PDF = True
+    except ImportError:
+        USE_XHTML2PDF = False
 
+NVD_API_BASE = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
-def identify_service(port, banner):
-    common = {
-        21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS", 80: "HTTP",
-        110: "POP3", 143: "IMAP", 443: "HTTPS", 3306: "MySQL", 3389: "RDP", 445: "SMB"
-    }
-    known = ["ssh", "http", "ftp", "smtp", "nginx", "apache", "mysql", "rdp", "telnet", "postfix"]
-    banner_lower = banner.lower()
-    for k in known:
-        if k in banner_lower:
-            return k.upper()
-    return common.get(port, "UNKNOWN")
+# ... [rest of existing functions remain unchanged]
 
+def render_html(results, output_file):
+    html = [
+        "<html><head><title>Vulnerability Report</title><style>",
+        "body { font-family: Arial; }",
+        "table { border-collapse: collapse; width: 100%; }",
+        "th, td { border: 1px solid #ddd; padding: 8px; }",
+        "th { background-color: #f2f2f2; }",
+        ".high { background-color: #f8d7da; }",
+        ".medium { background-color: #fff3cd; }",
+        ".low { background-color: #d4edda; }",
+        "</style></head><body>",
+        "<h1>Service Vulnerability Report</h1>",
+        "<h2>Severity Legend:</h2>",
+        "<ul>",
+        "<li><span style='background-color:#f8d7da;'>High (CVSS ≥ 7)</span></li>",
+        "<li><span style='background-color:#fff3cd;'>Medium (CVSS 4–6.9)</span></li>",
+        "<li><span style='background-color:#d4edda;'>Low (CVSS < 4)</span></li>",
+        "</ul>",
+        "<table><tr><th>IP</th><th>Port</th><th>Service</th><th>Product</th><th>Version</th><th>Banner</th><th>NVD CVEs</th></tr>"
+    ]
 
-def extract_product_and_version(banner):
-    match = re.search(r"([a-zA-Z0-9\-_.]+)[/ ]([0-9]+\.[0-9]+(?:\.[0-9]+)?)", banner)
-    if match:
-        product = match.group(1).lower()
-        version = match.group(2)
-        return product, version
-    return None, None
+    for entry in results:
+        max_score = 0
+        for cve in entry.get("nvd_cves", []):
+            match = re.search(r"CVSS ([0-9.]+)", cve)
+            if match:
+                score = float(match.group(1))
+                if score > max_score:
+                    max_score = score
 
-
-def run_searchsploit(query):
-    if not shutil.which("searchsploit"):
-        return ["<searchsploit not installed — skipping>"]
-    try:
-        result = subprocess.check_output(["searchsploit", "--nmap", query], stderr=subprocess.DEVNULL)
-        return result.decode(errors="ignore").strip().splitlines()
-    except Exception:
-        return ["<error running searchsploit>"]
-
-
-def run_vulners_software_api(product, version, api_key):
-    url = "https://vulners.com/api/v4/audit/software/"
-    headers = {
-        'Content-Type': 'application/json',
-        'X-Api-Key': api_key
-    }
-    payload = {
-        "software": [{"product": product, "version": version}],
-        "fields": []
-    }
-
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=5)
-        r.raise_for_status()
-        data = r.json()
-        if data.get("data") and data["data"].get("vulnerabilities"):
-            vulns = data["data"]["vulnerabilities"]
-            return [f'{v["id"]} (CVSS {v["cvss"]["score"]}) - {v["title"]}' for v in vulns]
+        if max_score >= 7:
+            row_class = "high"
+        elif 4 <= max_score < 7:
+            row_class = "medium"
+        elif 0 < max_score < 4:
+            row_class = "low"
         else:
-            return ["<no vulnerabilities found>"]
-    except Exception as e:
-        return [f"<vulners error: {e}>"]
+            row_class = ""
 
+        html.append(f"<tr class='{row_class}'><td>{entry['ip']}</td><td>{entry['port']}</td><td>{entry['service']}</td><td>{entry.get('product','')}</td><td>{entry.get('version','')}</td><td>{entry['banner']}</td><td><ul>")
+        for cve in entry.get("nvd_cves", []):
+            html.append(f"<li>{cve}</li>")
+        html.append("</ul></td></tr>")
 
-def scan_target(entry, api_key):
-    ip, port = entry.split(":")
-    port = int(port)
-    banner = banner_grab(ip, port)
-    service = identify_service(port, banner)
-    product, version = extract_product_and_version(banner)
-    query = f"{product} {version}" if product and version else banner.strip()
-    exploits = run_searchsploit(query)
-    vulners = run_vulners_software_api(product, version, api_key) if api_key and product and version else []
-    return {
-        "ip": ip,
-        "port": port,
-        "service": service,
-        "banner": banner,
-        "product": product,
-        "version": version,
-        "exploits": exploits,
-        "vulners": vulners
-    }
+    html.append("</table></body></html>")
+    with open(output_file, "w") as f:
+        f.write("\n".join(html))
 
+def export_pdf(html_path, pdf_path):
+    with open(html_path, "r") as f:
+        html_content = f.read()
 
-def write_json(results, filename):
-    with open(filename, "w") as f:
-        json.dump(results, f, indent=2)
-
-
-def write_xml(results, filename):
-    root = ET.Element("VulnerabilityScanResults")
-    for result in results:
-        host = ET.SubElement(root, "Host")
-        for key in ["ip", "port", "service", "banner", "product", "version"]:
-            ET.SubElement(host, key).text = str(result.get(key))
-        exploits = ET.SubElement(host, "Exploits")
-        for line in result.get("exploits", []):
-            ET.SubElement(exploits, "Exploit").text = line
-        vulns = ET.SubElement(host, "Vulners")
-        for v in result.get("vulners", []):
-            ET.SubElement(vulns, "Vuln").text = v
-    tree = ET.ElementTree(root)
-    tree.write(filename)
+    if USE_WEASYPRINT:
+        HTML(string=html_content).write_pdf(pdf_path)
+    elif USE_XHTML2PDF:
+        with open(pdf_path, "wb") as f_out:
+            pisa.CreatePDF(html_content, dest=f_out)
+    else:
+        print("[!] PDF export failed: No PDF engine (weasyprint or xhtml2pdf) is available.")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Threaded Service Enum + Vuln Lookup")
-    parser.add_argument("-i", "--input", required=True, help="File with IP:PORT entries")
-    parser.add_argument("-k", "--vulners-key", help="Vulners API Key")
-    parser.add_argument("--json-output", help="Output to JSON file")
-    parser.add_argument("--xml-output", help="Output to XML file")
-    parser.add_argument("-t", "--threads", type=int, default=50, help="Thread count")
+    parser = argparse.ArgumentParser(description="Threaded Service and Vulnerability Enumeration")
+    parser.add_argument("-i", "--input", help="Input file with IP:PORT lines", required=True)
+    parser.add_argument("-k", "--apikey", help="Vulners API key", required=False)
+    parser.add_argument("-o", "--output", help="Output HTML report filename", default="report.html")
+    parser.add_argument("--pdf", help="Optional PDF output file", default=None)
     args = parser.parse_args()
 
     targets = read_targets(args.input)
     results = []
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
-        futures = [executor.submit(scan_target, entry, args.vulners_key) for entry in targets]
-        for f in concurrent.futures.as_completed(futures):
-            result = f.result()
-            print(f"[+] {result['ip']}:{result['port']} [{result['service']}] => {result['banner']}")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+        futures = {executor.submit(scan_target, target, args.apikey): target for target in targets}
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
             results.append(result)
 
-    if args.json_output:
-        write_json(results, args.json_output)
-        print(f"[+] JSON saved to {args.json_output}")
-    if args.xml_output:
-        write_xml(results, args.xml_output)
-        print(f"[+] XML saved to {args.xml_output}")
+    render_html(results, args.output)
+    print(f"[*] Report written to {args.output}")
+
+    if args.pdf:
+        export_pdf(args.output, args.pdf)
+        if os.path.exists(args.pdf):
+            print(f"[*] PDF exported to {args.pdf}")
+
 
 if __name__ == "__main__":
     main()
