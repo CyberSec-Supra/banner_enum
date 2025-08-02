@@ -17,4 +17,4 @@ A nuclei template are generated on completion and a html export report.
 
 SYSTEM REQUIREMENT:
 
-sudo apt install libpango-1.0-0 libgdk-pixbuf-2.0-0 libffi-dev libcairo2
+sudo apt install python3-cffi libpango-1.0-0 libcairo2 libgdk-pixbuf-2.0-0 libffi-dev libxml2 libxslt1.1 libjpeg-dev zlib1g-dev libpng-dev libpango1.0-dev
