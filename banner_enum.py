@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+import argparse
+import socket
+import subprocess
+import requests
+import re
+import time
+import shutil
+import concurrent.futures
+import json
+import xml.etree.ElementTree as ET
+
+
+def read_targets(file_path):
+    with open(file_path, 'r') as f:
+        return [line.strip() for line in f if ':' in line]
+
+
+def banner_grab(ip, port, timeout=2):
+    try:
+        with socket.create_connection((str(ip), int(port)), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            try:
+                banner = sock.recv(1024).decode('utf-8', errors='ignore').strip()
+                return banner if banner else "<no banner>"
+            except socket.timeout:
+                return "<no banner (timeout)>"
+    except Exception as e:
+        return f"<error: {e}>"
+
+
+def identify_service(port, banner):
+    common = {
+        21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS", 80: "HTTP",
+        110: "POP3", 143: "IMAP", 443: "HTTPS", 3306: "MySQL", 3389: "RDP", 445: "SMB"
+    }
+    known = ["ssh", "http", "ftp", "smtp", "nginx", "apache", "mysql", "rdp", "telnet", "postfix"]
+    banner_lower = banner.lower()
+    for k in known:
+        if k in banner_lower:
+            return k.upper()
+    return common.get(port, "UNKNOWN")
+
+
+def extract_product_and_version(banner):
+    match = re.search(r"([a-zA-Z0-9\-_.]+)[/ ]([0-9]+\.[0-9]+(?:\.[0-9]+)?)", banner)
+    if match:
+        product = match.group(1).lower()
+        version = match.group(2)
+        return product, version
+    return None, None
+
+
+def run_searchsploit(query):
+    if not shutil.which("searchsploit"):
+        return ["<searchsploit not installed — skipping>"]
+    try:
+        result = subprocess.check_output(["searchsploit", "--nmap", query], stderr=subprocess.DEVNULL)
+        return result.decode(errors="ignore").strip().splitlines()
+    except Exception:
+        return ["<error running searchsploit>"]
+
+
+def run_vulners_software_api(product, version, api_key):
+    url = "https://vulners.com/api/v4/audit/software/"
+    headers = {
+        'Content-Type': 'application/json',
+        'X-Api-Key': api_key
+    }
+    payload = {
+        "software": [{"product": product, "version": version}],
+        "fields": []
+    }
+
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("data") and data["data"].get("vulnerabilities"):
+            vulns = data["data"]["vulnerabilities"]
+            return [f'{v["id"]} (CVSS {v["cvss"]["score"]}) - {v["title"]}' for v in vulns]
+        else:
+            return ["<no vulnerabilities found>"]
+    except Exception as e:
+        return [f"<vulners error: {e}>"]
+
+
+def scan_target(entry, api_key):
+    ip, port = entry.split(":")
+    port = int(port)
+    banner = banner_grab(ip, port)
+    service = identify_service(port, banner)
+    product, version = extract_product_and_version(banner)
+    query = f"{product} {version}" if product and version else banner.strip()
+    exploits = run_searchsploit(query)
+    vulners = run_vulners_software_api(product, version, api_key) if api_key and product and version else []
+    return {
+        "ip": ip,
+        "port": port,
+        "service": service,
+        "banner": banner,
+        "product": product,
+        "version": version,
+        "exploits": exploits,
+        "vulners": vulners
+    }
+
+
+def write_json(results, filename):
+    with open(filename, "w") as f:
+        json.dump(results, f, indent=2)
+
+
+def write_xml(results, filename):
+    root = ET.Element("VulnerabilityScanResults")
+    for result in results:
+        host = ET.SubElement(root, "Host")
+        for key in ["ip", "port", "service", "banner", "product", "version"]:
+            ET.SubElement(host, key).text = str(result.get(key))
+        exploits = ET.SubElement(host, "Exploits")
+        for line in result.get("exploits", []):
+            ET.SubElement(exploits, "Exploit").text = line
+        vulns = ET.SubElement(host, "Vulners")
+        for v in result.get("vulners", []):
+            ET.SubElement(vulns, "Vuln").text = v
+    tree = ET.ElementTree(root)
+    tree.write(filename)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Threaded Service Enum + Vuln Lookup")
+    parser.add_argument("-i", "--input", required=True, help="File with IP:PORT entries")
+    parser.add_argument("-k", "--vulners-key", help="Vulners API Key")
+    parser.add_argument("--json-output", help="Output to JSON file")
+    parser.add_argument("--xml-output", help="Output to XML file")
+    parser.add_argument("-t", "--threads", type=int, default=50, help="Thread count")
+    args = parser.parse_args()
+
+    targets = read_targets(args.input)
+    results = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
+        futures = [executor.submit(scan_target, entry, args.vulners_key) for entry in targets]
+        for f in concurrent.futures.as_completed(futures):
+            result = f.result()
+            print(f"[+] {result['ip']}:{result['port']} [{result['service']}] => {result['banner']}")
+            results.append(result)
+
+    if args.json_output:
+        write_json(results, args.json_output)
+        print(f"[+] JSON saved to {args.json_output}")
+    if args.xml_output:
+        write_xml(results, args.xml_output)
+        print(f"[+] XML saved to {args.xml_output}")
+
+if __name__ == "__main__":
+    main()
