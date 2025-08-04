@@ -7,12 +7,12 @@ it continues then to take the identified service and search through searchsploit
 API key for VULNERS needed for online searching.
 Local copy of searchsploit required to search local.
 
-USAGE:
-usage: banner_enum.py [-h] -i INPUT [-k APIKEY] [-o OUTPUT] [--json JSON] [--xml XML] [--nuclei NUCLEI] [--pdf PDF]
+USAGE:</br>
+banner_enum.py [-h] -i INPUT [-k APIKEY] [-o OUTPUT] [--json JSON] [--xml XML] [--nuclei NUCLEI] [--pdf PDF]
 
 
 
-A nuclei template are generated on completion and a html export report. 
+A nuclei template is generated on completion and a html export report. 
 
 
 SYSTEM REQUIREMENT:
